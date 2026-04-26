@@ -1,6 +1,22 @@
+
 import { io, Socket } from "socket.io-client";
 
+// Support both local and production URLs
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "http://localhost:6001";
+
+// Helper to extract origin and path for Socket.IO
+function getSocketConfig() {
+  try {
+    const url = new URL(WS_URL);
+    return {
+      origin: url.origin,
+      path: url.pathname.replace(/\/$/, "") + "/socket.io"
+    };
+  } catch {
+    // fallback for plain host
+    return { origin: WS_URL, path: "/socket.io" };
+  }
+}
 
 let socket: Socket | null = null;
 let currentToken: string | null = null;
@@ -14,7 +30,9 @@ export function connectSocket(token: string): Socket {
   }
 
   currentToken = token;
-  socket = io(`${WS_URL}/drivers`, {
+  const { origin, path } = getSocketConfig();
+  socket = io(origin + "/drivers", {
+    path,
     auth: { token },
     transports: ["websocket", "polling"],
     autoConnect: true,
