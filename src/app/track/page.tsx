@@ -1,12 +1,19 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { clearAuth, getToken, useAuthUser } from "@/lib/auth";
-import { connectSocket, disconnectSocket } from "@/lib/socket";
-import type { LocationPayload } from "@/lib/types";
+import { connectSocket, disconnectSocket, getSocket } from "@/lib/socket";
 
-interface LastPoint extends LocationPayload {
+const UPDATE_INTERVAL_MS = 3000;
+const DEFAULT_RATING = 4.8;
+
+interface LastFix {
+  lat: number;
+  lng: number;
+  accuracy?: number;
+  speed?: number;
+  heading?: number;
   timestamp: number;
 }
 
@@ -14,84 +21,136 @@ export default function TrackPage() {
   const router = useRouter();
   const user = useAuthUser();
   const [sharing, setSharing] = useState(false);
-  const [last, setLast] = useState<LastPoint | null>(null);
+  const [last, setLast] = useState<LastFix | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sentCount, setSentCount] = useState(0);
-  const watchIdRef = useRef<number | null>(null);
+  const [connected, setConnected] = useState(false);
 
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Auth guard + socket lifecycle
   useEffect(() => {
     const token = getToken();
     if (!user || !token) {
       router.replace("/login");
       return;
     }
-    if (user.role === "ADMIN") {
-      router.replace("/admin");
+    if (user.type === "rider") {
+      router.replace("/dashboard");
       return;
     }
-    connectSocket(token);
+
+    const socket = connectSocket(token);
+    setConnected(socket.connected);
+
+    const onConnect = () => setConnected(true);
+    const onDisconnect = () => setConnected(false);
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
 
     return () => {
-      stopWatch();
+      socket.off("connect", onConnect);
+      socket.off("disconnect", onDisconnect);
+      stopSharing();
       disconnectSocket();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
-  function stopWatch() {
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
+  /** Reads one GPS fix. */
+  const readPosition = useCallback((): Promise<LastFix> => {
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) {
+        reject(new Error("Geolocation not supported"));
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const fix: LastFix = {
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+            accuracy: pos.coords.accuracy ?? undefined,
+            speed: pos.coords.speed ?? undefined,
+            heading: pos.coords.heading ?? undefined,
+            timestamp: pos.timestamp,
+          };
+          console.log("[Driver] Got location fix:", fix);
+          setLast(fix);
+          resolve(fix);
+        },
+        (err) => reject(new Error(err.message)),
+        { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 },
+      );
+    });
+  }, []);
+
+  /** Pushes the latest fix to the backend via socket. */
+  const pushUpdate = useCallback(
+    (fix: LastFix) => {
+      if (!user) return;
+      const socket = getSocket();
+      if (!socket || !socket.connected) return;
+
+      const payload = {
+        driverId: user.id,
+        lat: fix.lat,
+        lng: fix.lng,
+        status: "available" as const,
+        vehicleType: user.vehicleType ?? "car",
+        rating: DEFAULT_RATING,
+        heading: Math.max(0, Math.min(360, fix.heading ?? 0)),
+        speedKmh: fix.speed ? Math.max(0, fix.speed * 3.6) : 0,
+      };
+
+      socket.emit("location:update", payload, (ack: unknown) => {
+        if (
+          ack &&
+          typeof ack === "object" &&
+          "success" in ack &&
+          (ack as { success: boolean }).success
+        ) {
+          setSentCount((c) => c + 1);
+        }
+      });
+    },
+    [user],
+  );
+
+  function stopSharing() {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
     }
     setSharing(false);
   }
 
-  function startWatch() {
+  async function startSharing() {
     setError(null);
     if (!navigator.geolocation) {
       setError("Geolocation is not supported by this browser");
       return;
     }
-    const id = navigator.geolocation.watchPosition(
-      (pos) => {
-        const payload: LocationPayload = {
-          latitude: pos.coords.latitude,
-          longitude: pos.coords.longitude,
-          accuracy: pos.coords.accuracy ?? undefined,
-          speed: pos.coords.speed ?? undefined,
-          heading: pos.coords.heading ?? undefined,
-        };
-        setLast({ ...payload, timestamp: pos.timestamp });
-        const socket = connectSocket(getToken() || "");
-        console.log(
-          "[track] emitting location:update, connected=",
-          socket.connected,
-          payload,
-        );
-        socket.emit("location:update", payload, (ack: unknown) => {
-          console.log("[track] ack received:", ack);
-          if (ack && typeof ack === "object" && "ok" in ack) {
-            const ok = (ack as { ok: boolean }).ok;
-            if (ok) setSentCount((c) => c + 1);
-          }
-        });
-      },
-      (err) => {
-        setError(err.message);
-        stopWatch();
-      },
-      {
-        enableHighAccuracy: true,
-        maximumAge: 0,
-        timeout: 15000,
-      },
-    );
-    watchIdRef.current = id;
-    setSharing(true);
+    try {
+      const first = await readPosition();
+      pushUpdate(first);
+
+      intervalRef.current = setInterval(async () => {
+        try {
+          const fix = await readPosition();
+          pushUpdate(fix);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "GPS read failed");
+        }
+      }, UPDATE_INTERVAL_MS);
+
+      setSharing(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start sharing");
+    }
   }
 
   function logout() {
-    stopWatch();
+    stopSharing();
     disconnectSocket();
     clearAuth();
     router.replace("/login");
@@ -116,12 +175,27 @@ export default function TrackPage() {
         </header>
 
         <section className="bg-white rounded-lg p-5 shadow space-y-4">
-          <h1 className="text-xl font-bold text-slate-900">Share Location</h1>
+          <div className="flex items-center justify-between">
+            <h1 className="text-xl font-bold text-slate-900">
+              Driver Location
+            </h1>
+            <span
+              className={`text-xs px-2 py-0.5 rounded ${
+                connected
+                  ? "bg-green-100 text-green-700"
+                  : "bg-slate-200 text-slate-600"
+              }`}
+            >
+              {connected ? "Socket connected" : "Disconnected"}
+            </span>
+          </div>
+
           {error && (
             <div className="p-2 bg-red-50 text-red-700 text-sm rounded">
               {error}
             </div>
           )}
+
           <div className="flex items-center gap-3">
             <span
               className={`inline-block w-3 h-3 rounded-full ${
@@ -129,24 +203,29 @@ export default function TrackPage() {
               }`}
             />
             <span className="text-slate-700">
-              {sharing ? "Sharing live location" : "Not sharing"}
+              {sharing
+                ? `Sharing live location (every ${UPDATE_INTERVAL_MS / 1000}s)`
+                : "Not sharing"}
             </span>
           </div>
+
           {!sharing ? (
             <button
-              onClick={startWatch}
-              className="w-full py-2 rounded bg-green-600 text-white font-semibold hover:bg-green-700"
+              onClick={startSharing}
+              disabled={!connected}
+              className="w-full py-2 rounded bg-green-600 text-white font-semibold hover:bg-green-700 disabled:opacity-50"
             >
               Start sharing
             </button>
           ) : (
             <button
-              onClick={stopWatch}
+              onClick={stopSharing}
               className="w-full py-2 rounded bg-red-600 text-white font-semibold hover:bg-red-700"
             >
               Stop sharing
             </button>
           )}
+
           <div className="text-xs text-slate-500">
             Updates sent: <b>{sentCount}</b>
           </div>
@@ -156,10 +235,10 @@ export default function TrackPage() {
           <section className="bg-white rounded-lg p-5 shadow space-y-1 text-sm text-slate-700">
             <h2 className="font-semibold text-slate-900 mb-2">Last fix</h2>
             <div>
-              <b>Lat:</b> {last.latitude.toFixed(6)}
+              <b>Lat:</b> {last.lat.toFixed(6)}
             </div>
             <div>
-              <b>Lng:</b> {last.longitude.toFixed(6)}
+              <b>Lng:</b> {last.lng.toFixed(6)}
             </div>
             {last.accuracy !== undefined && (
               <div>
@@ -168,7 +247,12 @@ export default function TrackPage() {
             )}
             {last.speed !== undefined && last.speed !== null && (
               <div>
-                <b>Speed:</b> {last.speed.toFixed(1)} m/s
+                <b>Speed:</b> {(last.speed * 3.6).toFixed(1)} km/h
+              </div>
+            )}
+            {last.heading !== undefined && last.heading !== null && (
+              <div>
+                <b>Heading:</b> {last.heading.toFixed(0)}°
               </div>
             )}
             <div className="text-xs text-slate-500 pt-2">

@@ -11,7 +11,7 @@ export default function Home() {
 
   useEffect(() => {
     if (user) {
-      router.replace(user.role === "ADMIN" ? "/admin" : "/track");
+      router.replace(user.type === "rider" ? "/dashboard" : "/track");
     }
   }, [user, router]);
 

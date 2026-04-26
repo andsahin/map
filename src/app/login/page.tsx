@@ -23,13 +23,33 @@ export default function LoginPage() {
         email,
         password,
       });
-      saveAuth(data.accessToken, data.user);
-      router.replace(data.user.role === "ADMIN" ? "/admin" : "/track");
+      // Immediately get live location after login
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          saveLocation(pos.coords.latitude, pos.coords.longitude);
+          saveAuth(data.accessToken, data.user);
+          router.replace(data.user.type === "rider" ? "/dashboard" : "/track");
+        },
+        () => {
+          // If denied, still proceed
+          saveAuth(data.accessToken, data.user);
+          router.replace(data.user.type === "rider" ? "/dashboard" : "/track");
+        },
+        { enableHighAccuracy: true, timeout: 8000 }
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
       setLoading(false);
     }
+  }
+
+  // Save location to localStorage for use in /ride or /track
+  function saveLocation(lat: number, lng: number) {
+    try {
+      localStorage.setItem("ride_lat", String(lat));
+      localStorage.setItem("ride_lng", String(lng));
+    } catch {}
   }
 
   return (

@@ -14,9 +14,9 @@ export function connectSocket(token: string): Socket {
   }
 
   currentToken = token;
-  socket = io(`${WS_URL}/tracking`, {
+  socket = io(`${WS_URL}/drivers`, {
     auth: { token },
-    transports: ["polling", "websocket"],
+    transports: ["websocket", "polling"],
     autoConnect: true,
     reconnection: true,
   });

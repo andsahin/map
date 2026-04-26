@@ -7,9 +7,93 @@ import {
   useJsApiLoader,
 } from "@react-google-maps/api";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { api } from "@/lib/api";
+
+type DriverVehicle = "bike" | "car" | "cng";
+interface NearbyDriver {
+  driverId: string;
+  lat: number;
+  lng: number;
+  vehicleType: DriverVehicle;
+  rating: number;
+  heading: number;
+}
+interface NearestResponse {
+  drivers: NearbyDriver[];
+}
+
+const VEHICLE_LOGO: Record<DriverVehicle, string> = {
+  car: "/logos/car.png",
+  bike: "/logos/bike.png",
+  cng: "/logos/cng.png",
+};
+
+// Cache of background-removed logos as data URLs.
+const transparentLogoCache = new Map<DriverVehicle, string>();
+const transparentLogoPending = new Map<DriverVehicle, Promise<string>>();
+
+/**
+ * Loads a logo PNG, removes near-white / blue-ish background pixels via canvas,
+ * and returns a transparent PNG data URL. Result is cached per vehicle.
+ */
+function getTransparentLogo(vehicle: DriverVehicle): Promise<string> {
+  const cached = transparentLogoCache.get(vehicle);
+  if (cached) return Promise.resolve(cached);
+  const pending = transparentLogoPending.get(vehicle);
+  if (pending) return pending;
+
+  const url = VEHICLE_LOGO[vehicle];
+  const promise = new Promise<string>((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const w = img.naturalWidth;
+      const h = img.naturalHeight;
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return resolve(url);
+      ctx.drawImage(img, 0, 0);
+      try {
+        const data = ctx.getImageData(0, 0, w, h);
+        const px = data.data;
+        for (let i = 0; i < px.length; i += 4) {
+          const r = px[i];
+          const g = px[i + 1];
+          const b = px[i + 2];
+          // Treat blue-dominant pixels OR near-white pixels as background.
+          const isBlueBg = b > 110 && b > r + 25 && b > g + 10;
+          const isLightBg = r > 235 && g > 235 && b > 235;
+          if (isBlueBg || isLightBg) {
+            px[i + 3] = 0; // transparent
+          }
+        }
+        ctx.putImageData(data, 0, 0);
+        resolve(canvas.toDataURL("image/png"));
+      } catch {
+        resolve(url);
+      }
+    };
+    img.onerror = reject;
+    img.src = url;
+  })
+    .then((result) => {
+      transparentLogoCache.set(vehicle, result);
+      transparentLogoPending.delete(vehicle);
+      return result;
+    })
+    .catch((err) => {
+      transparentLogoPending.delete(vehicle);
+      throw err;
+    });
+
+  transparentLogoPending.set(vehicle, promise);
+  return promise;
+}
 
 const LIBRARIES: ("places")[] = ["places"];
-const FALLBACK_CENTER = { lat: 23.7554, lng: 90.3758 };
+const FALLBACK_CENTER = { lat: 23.8554, lng: 90.3758 };
 
 type LatLng = { lat: number; lng: number };
 
@@ -93,16 +177,27 @@ export default function RidePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Always use live location, never fallback to static or localStorage
   useEffect(() => {
-    navigator.geolocation?.getCurrentPosition(
-      (pos) => {
-        const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        setCenter(loc);
-        setMyLocation(loc);
-      },
-      () => {/* permission denied — keep fallback */},
-      { enableHighAccuracy: true, timeout: 8000 },
-    );
+    let watchId: number | null = null;
+    function update(pos: GeolocationPosition) {
+      const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      console.log("Got location update:", loc);
+      setCenter(loc);
+      setMyLocation(loc);
+    }
+    if (navigator.geolocation) {
+      watchId = navigator.geolocation.watchPosition(
+        update,
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+      );
+    }
+    return () => {
+      if (watchId !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(watchId);
+      }
+    };
   }, []);
 
   async function useMyLocation() {
@@ -160,10 +255,107 @@ export default function RidePage() {
   const polylineRef = useRef<google.maps.Polyline | null>(null);
   const originMarkerRef = useRef<google.maps.Marker | null>(null);
   const destMarkerRef = useRef<google.maps.Marker | null>(null);
+  const driverMarkersRef = useRef<Map<string, google.maps.Marker>>(new Map());
 
   const onMapLoad = useCallback((map: google.maps.Map) => {
     mapRef.current = map;
   }, []);
+
+  // Render / refresh nearby driver markers whenever location changes (poll every 5s)
+  useEffect(() => {
+    if (!isLoaded || !myLocation) return;
+    let cancelled = false;
+
+    async function refresh() {
+      try {
+        const data = await api.get<NearestResponse>(
+          `/drivers/nearest?riderLat=${myLocation!.lat}&riderLng=${myLocation!.lng}&maxResults=10`,
+        );
+        if (cancelled || !mapRef.current) return;
+
+        // Spread out drivers that share (almost) the same coordinates so
+        // their markers don't stack on the map. Offsets are deterministic
+        // per (lat,lng) bucket so positions stay stable across polls.
+        const SAME_SPOT_M = 25; // bucket size in metres
+        const SPREAD_M = 30;    // ring radius for fanned-out markers
+        const buckets = new Map<string, NearbyDriver[]>();
+        for (const d of data.drivers ?? []) {
+          // ~0.0001 deg ≈ 11 m, so dividing by 0.00025 ≈ 27 m buckets
+          const key = `${(d.lat / 0.00025).toFixed(0)}:${(d.lng / 0.00025).toFixed(0)}`;
+          if (!buckets.has(key)) buckets.set(key, []);
+          buckets.get(key)!.push(d);
+        }
+        const renderPos = new Map<string, { lat: number; lng: number }>();
+        for (const group of buckets.values()) {
+          if (group.length === 1) {
+            const d = group[0];
+            renderPos.set(d.driverId, { lat: d.lat, lng: d.lng });
+            continue;
+          }
+          // Sort to keep stable ordering, then fan out around the centroid
+          group.sort((a, b) => a.driverId.localeCompare(b.driverId));
+          const cLat = group.reduce((s, d) => s + d.lat, 0) / group.length;
+          const cLng = group.reduce((s, d) => s + d.lng, 0) / group.length;
+          const dLat = SPREAD_M / 111_320; // metres → degrees latitude
+          const dLng =
+            SPREAD_M / (111_320 * Math.cos((cLat * Math.PI) / 180));
+          group.forEach((d, idx) => {
+            const angle = (2 * Math.PI * idx) / group.length;
+            renderPos.set(d.driverId, {
+              lat: cLat + Math.sin(angle) * dLat,
+              lng: cLng + Math.cos(angle) * dLng,
+            });
+          });
+        }
+        void SAME_SPOT_M;
+
+        const seen = new Set<string>();
+        for (const d of data.drivers ?? []) {
+          seen.add(d.driverId);
+          const existing = driverMarkersRef.current.get(d.driverId);
+          const iconUrl = await getTransparentLogo(d.vehicleType).catch(
+            () => VEHICLE_LOGO[d.vehicleType] ?? VEHICLE_LOGO.car,
+          );
+          if (cancelled || !mapRef.current) return;
+          const icon: google.maps.Icon = {
+            url: iconUrl,
+            scaledSize: new google.maps.Size(56, 56),
+            anchor: new google.maps.Point(28, 28),
+          };
+          const pos = renderPos.get(d.driverId) ?? { lat: d.lat, lng: d.lng };
+          if (existing) {
+            existing.setPosition(pos);
+            existing.setIcon(icon);
+          } else {
+            const marker = new google.maps.Marker({
+              position: pos,
+              map: mapRef.current,
+              icon,
+              title: `${d.vehicleType.toUpperCase()} \u2605 ${d.rating.toFixed(1)}`,
+              zIndex: 8,
+            });
+            driverMarkersRef.current.set(d.driverId, marker);
+          }
+        }
+        // Remove markers no longer present
+        for (const [id, marker] of driverMarkersRef.current) {
+          if (!seen.has(id)) {
+            marker.setMap(null);
+            driverMarkersRef.current.delete(id);
+          }
+        }
+      } catch {
+        // ignore polling errors silently
+      }
+    }
+
+    refresh();
+    const interval = setInterval(refresh, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [isLoaded, myLocation]);
 
   function clearMapOverlays() {
     polylineRef.current?.setMap(null);
