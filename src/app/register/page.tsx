@@ -5,16 +5,25 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { saveAuth } from "@/lib/auth";
-import type { AuthResponse, UserRole } from "@/lib/types";
+import type { AuthResponse, UserType, VehicleType } from "@/lib/types";
 
 export default function RegisterPage() {
   const router = useRouter();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [role, setRole] = useState<UserRole>("USER");
+  const [type, setType] = useState<UserType>("rider");
+  const [vehicleType, setVehicleType] = useState<VehicleType>("car");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // Save location to localStorage for use in /ride or /track
+  function saveLocation(lat: number, lng: number) {
+    try {
+      localStorage.setItem("ride_lat", String(lat));
+      localStorage.setItem("ride_lng", String(lng));
+    } catch {}
+  }
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -25,10 +34,23 @@ export default function RegisterPage() {
         name,
         email,
         password,
-        role,
+        type,
+        ...(type === "driver" ? { vehicleType } : {}),
       });
-      saveAuth(data.accessToken, data.user);
-      router.replace(data.user.role === "ADMIN" ? "/admin" : "/track");
+      // Immediately get live location after register
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          saveLocation(pos.coords.latitude, pos.coords.longitude);
+          saveAuth(data.accessToken, data.user);
+          router.replace(data.user.type === "rider" ? "/dashboard" : "/track");
+        },
+        () => {
+          // If denied, still proceed
+          saveAuth(data.accessToken, data.user);
+          router.replace(data.user.type === "rider" ? "/dashboard" : "/track");
+        },
+        { enableHighAccuracy: true, timeout: 8000 }
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Registration failed");
     } finally {
@@ -79,16 +101,31 @@ export default function RegisterPage() {
           />
         </label>
         <label className="block">
-          <span className="text-sm text-slate-700">Role</span>
+          <span className="text-sm text-slate-700">Account type</span>
           <select
-            value={role}
-            onChange={(e) => setRole(e.target.value as UserRole)}
+            value={type}
+            onChange={(e) => setType(e.target.value as UserType)}
             className="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-slate-900"
           >
-            <option value="USER">User (share location)</option>
-            <option value="ADMIN">Admin (view map)</option>
+            <option value="rider">Rider (book a ride)</option>
+            <option value="driver">Driver (share location)</option>
           </select>
         </label>
+
+        {type === "driver" && (
+          <label className="block">
+            <span className="text-sm text-slate-700">Vehicle type</span>
+            <select
+              value={vehicleType}
+              onChange={(e) => setVehicleType(e.target.value as VehicleType)}
+              className="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-slate-900"
+            >
+              <option value="car">Car</option>
+              <option value="bike">Bike</option>
+              <option value="cng">CNG</option>
+            </select>
+          </label>
+        )}
         <button
           type="submit"
           disabled={loading}

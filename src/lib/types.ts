@@ -1,10 +1,12 @@
-export type UserRole = "USER" | "ADMIN";
+export type UserType = "rider" | "driver";
+export type VehicleType = "bike" | "car" | "cng";
 
 export interface AuthUser {
   id: string;
   name: string;
   email: string;
-  role: UserRole;
+  type: UserType;
+  vehicleType: VehicleType | null;
 }
 
 export interface AuthResponse {

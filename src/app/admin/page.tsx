@@ -23,7 +23,7 @@ export default function AdminPage() {
       router.replace("/login");
       return;
     }
-    if (user.role !== "ADMIN") {
+    if (user.type !== "rider") {
       router.replace("/track");
       return;
     }
